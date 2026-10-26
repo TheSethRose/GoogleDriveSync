@@ -107,6 +107,11 @@ struct SyncFolder: Identifiable, Codable, Equatable {
     var displayName: String {
         URL(fileURLWithPath: localPath).lastPathComponent
     }
+
+    /// Stable, unique folder name for this sync's backups.
+    var backupName: String {
+        "\(displayName)-\(id.uuidString.prefix(8))"
+    }
     
     var fullRemotePath: String {
         if remotePath.isEmpty {

@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **No more permanent deletes**: files a sync deletes or overwrites are moved to `_DriveSync Backups/` on the remote and `~/Library/Application Support/GoogleDriveSync/Backups/` locally.
+- **Two-way sync safety**: bisync stops if a run would delete more than 5% of files, and a missing or empty local folder is never synced.
+- **Resync recovery**: the resync step now passes `--resync`; retryable errors no longer force a resync.
+- **Google Docs/Sheets** are skipped instead of failing the sync or being deleted.
+- **Clearer errors**: the menu shows rclone's actual error lines instead of only its summary.
+- **Account rename** keeps every remote setting and no longer passes the OAuth token on the command line.
+
+### Added
+- A warning when a folder syncs with the root of the remote.
+
 ## [1.1.3] - 2026-03-10
 
 ### Added

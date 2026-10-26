@@ -362,6 +362,7 @@ class SyncManager: ObservableObject {
             let ignoredPatterns = folders[index].ignoredPatterns
             let syncMode = folders[index].syncMode
             let bisyncState = folders[index].bisyncState
+            let backupName = folders[index].backupName
 
             // Resolve the actual local path (handling Volume-1 issues)
             let resolvedPath = resolveLocalPath(localPath)
@@ -374,7 +375,8 @@ class SyncManager: ObservableObject {
                     result = try await rclone.sync(
                         source: resolvedPath,
                         destination: remotePath,
-                        ignoredPatterns: ignoredPatterns
+                        ignoredPatterns: ignoredPatterns,
+                        backupName: backupName
                     ) { [weak self] progress in
                         Task { @MainActor in
                             self?.syncProgress =
@@ -397,6 +399,7 @@ class SyncManager: ObservableObject {
                         local: resolvedPath,
                         remote: remotePath,
                         ignoredPatterns: ignoredPatterns,
+                        backupName: backupName,
                         mode: mode
                     ) { [weak self] progress in
                         Task { @MainActor in
@@ -510,6 +513,7 @@ class SyncManager: ObservableObject {
         let ignoredPatterns = folders[index].ignoredPatterns
         let syncMode = folders[index].syncMode
         let bisyncState = folders[index].bisyncState
+        let backupName = folders[index].backupName
 
         // Resolve the actual local path (handling Volume-1 issues)
         let resolvedPath = resolveLocalPath(localPath)
@@ -522,7 +526,8 @@ class SyncManager: ObservableObject {
                 result = try await rclone.sync(
                     source: resolvedPath,
                     destination: remotePath,
-                    ignoredPatterns: ignoredPatterns
+                    ignoredPatterns: ignoredPatterns,
+                    backupName: backupName
                 ) { [weak self] progress in
                     Task { @MainActor in
                         self?.syncProgress =
@@ -545,6 +550,7 @@ class SyncManager: ObservableObject {
                     local: resolvedPath,
                     remote: remotePath,
                     ignoredPatterns: ignoredPatterns,
+                    backupName: backupName,
                     mode: mode
                 ) { [weak self] progress in
                     Task { @MainActor in

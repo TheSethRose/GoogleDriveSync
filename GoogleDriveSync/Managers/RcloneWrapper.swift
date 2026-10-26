@@ -20,7 +20,8 @@ enum RcloneError: LocalizedError {
     case syncFailed(String)
     case bisyncNeedsResync(String)
     case invalidRemote(String)
-    
+    case unsafeLocalFolder(String)
+
     var errorDescription: String? {
         switch self {
         case .notInstalled:
@@ -33,6 +34,8 @@ enum RcloneError: LocalizedError {
             return "Bi-Sync failed and requires a resync: \(message)"
         case .invalidRemote(let name):
             return "Invalid remote: \(name)"
+        case .unsafeLocalFolder(let message):
+            return "Skipped to protect your files: \(message)"
         }
     }
 }
@@ -59,7 +62,12 @@ struct RcloneRemote: Identifiable, Equatable, Hashable {
 actor RcloneWrapper {
     private let rclonePath: String
     private let runner = ProcessRunner.shared
-    
+
+    /// Folder on the remote that receives files a sync deletes or overwrites.
+    static let backupFolderName = "_DriveSync Backups"
+    /// Bisync aborts if a run would delete more than this percentage of files on either side.
+    static let maxDeletePercent = 5
+
     init(rclonePath: String = AppSettings.defaultRclonePath) {
         self.rclonePath = rclonePath
     }
@@ -131,36 +139,35 @@ actor RcloneWrapper {
     
     /// Rename an existing remote
     func renameRemote(from oldName: String, to newName: String) async throws {
-        // Use rclone config update to effectively rename by creating new and deleting old
-        // First, get the config for the old remote
-        let showResult = try await runner.run(rclonePath, arguments: ["config", "show", oldName])
-        guard showResult.isSuccess else {
+        // rclone has no rename command. Renaming the section header in the config file keeps
+        // every option and never passes the OAuth token on a command line.
+        let fileResult = try await runner.run(rclonePath, arguments: ["config", "file"])
+        guard fileResult.isSuccess,
+              let configPath = fileResult.stdout
+                .components(separatedBy: "\n")
+                .last(where: { $0.hasPrefix("/") })?
+                .trimmingCharacters(in: .whitespaces) else {
+            throw RcloneError.configurationFailed("Could not find the rclone config file")
+        }
+
+        let contents = try String(contentsOfFile: configPath, encoding: .utf8)
+        if contents.hasPrefix("# Encrypted rclone configuration") {
+            throw RcloneError.configurationFailed("Encrypted rclone configs can't be renamed here. Use 'rclone config' instead.")
+        }
+
+        var lines = contents.components(separatedBy: "\n")
+        guard !lines.contains("[\(newName)]") else {
+            throw RcloneError.configurationFailed("An account named \(newName) already exists")
+        }
+        guard let index = lines.firstIndex(of: "[\(oldName)]") else {
             throw RcloneError.invalidRemote(oldName)
         }
-        
-        // Parse the config to get the token
-        let configLines = showResult.stdout.components(separatedBy: "\n")
-        var token = ""
-        for line in configLines {
-            if line.hasPrefix("token = ") {
-                token = String(line.dropFirst("token = ".count))
-            }
-        }
-        
-        // Create new remote with the new name using the same token
-        let createArgs = ["config", "create", newName, "drive", "token", token]
-        let createResult = try await runner.run(rclonePath, arguments: createArgs)
-        guard createResult.isSuccess else {
-            throw RcloneError.configurationFailed("Failed to create new remote: \(createResult.stderr)")
-        }
-        
-        // Delete the old remote
-        let deleteResult = try await runner.run(rclonePath, arguments: ["config", "delete", oldName])
-        guard deleteResult.isSuccess else {
-            // Try to clean up the new one if delete fails
-            _ = try? await runner.run(rclonePath, arguments: ["config", "delete", newName])
-            throw RcloneError.configurationFailed("Failed to delete old remote: \(deleteResult.stderr)")
-        }
+
+        lines[index] = "[\(newName)]"
+        // An atomic write replaces the file, so restore its owner-only permissions afterwards.
+        let permissions = (try? FileManager.default.attributesOfItem(atPath: configPath)[.posixPermissions]) ?? 0o600
+        try lines.joined(separator: "\n").write(toFile: configPath, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: configPath)
     }
     
     /// Delete a remote
@@ -216,11 +223,17 @@ actor RcloneWrapper {
         source: String,
         destination: String,
         ignoredPatterns: [String] = [],
+        backupName: String,
         dryRun: Bool = false,
         onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> SyncResult {
+        // An empty or missing source would make sync delete everything on the remote.
+        try Self.checkLocalFolder(source)
+
         var args = ["sync", source, destination, "--progress", "--stats-one-line"]
-        
+        args += Self.safetyArguments()
+        args += ["--backup-dir", Self.remoteBackupPath(remote: destination, backupName: backupName)]
+
         for pattern in ignoredPatterns {
             let trimmed = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty && !trimmed.hasPrefix("#") {
@@ -254,10 +267,10 @@ actor RcloneWrapper {
                 error: nil
             )
         } else {
-            throw RcloneError.syncFailed(result.stderr)
+            throw RcloneError.syncFailed(Self.errorSummary(result.stdout + "\n" + result.stderr))
         }
     }
-    
+
     func copy(
         source: String,
         destination: String,
@@ -295,19 +308,22 @@ actor RcloneWrapper {
                 error: nil
             )
         } else {
-            throw RcloneError.syncFailed(result.stderr)
+            throw RcloneError.syncFailed(Self.errorSummary(result.stdout + "\n" + result.stderr))
         }
     }
-    
+
     func bidirectionalSync(
         local: String,
         remote: String,
         ignoredPatterns: [String] = [],
+        backupName: String,
         mode: BisyncMode,
         dryRun: Bool = false,
         onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> SyncResult {
-        
+        // A missing folder (e.g. an unmounted volume) must never be treated as "everything was deleted".
+        try Self.checkLocalFolder(local)
+
         var args = [
             "bisync",
             local,
@@ -317,11 +333,17 @@ actor RcloneWrapper {
             "--resilient",
             "--recover",
             "--max-lock", "2m",
-            "--conflict-resolve", "newer"
+            "--conflict-resolve", "newer",
+            "--max-delete", String(Self.maxDeletePercent),
+            "--backup-dir1", Self.localBackupPath(backupName: backupName),
+            "--backup-dir2", Self.remoteBackupPath(remote: remote, backupName: backupName)
         ]
+        args += Self.safetyArguments()
 
-        if mode == .initial {
+        if mode == .initial || mode == .resync {
+            // A resync merges both sides without deleting anything.
             args.append(contentsOf: [
+                "--resync",
                 "--resync-mode", "newer"
             ])
         }
@@ -363,11 +385,11 @@ actor RcloneWrapper {
         let duration = Date().timeIntervalSince(startTime)
 
         guard result.isSuccess else {
-            let errorMessage = result.stderr.isEmpty
-                ? result.stdout
-                : result.stderr
+            let errorOutput = result.stdout + "\n" + result.stderr
+            let errorMessage = Self.errorSummary(errorOutput)
 
-            if result.exitCode == 7 {
+            // Exit code 7 is also used for critical errors that --resilient will retry on its own.
+            if result.exitCode == 7 && !errorOutput.contains("retryable without --resync") {
                 throw RcloneError.bisyncNeedsResync(errorMessage)
             }
 
@@ -386,7 +408,78 @@ actor RcloneWrapper {
     }
 
     // MARK: - Helpers
-    
+
+    /// Flags shared by every sync that can delete or overwrite files.
+    private static func safetyArguments() -> [String] {
+        [
+            // Native Google Docs/Sheets can't be downloaded as files; skipping them keeps them untouched.
+            "--drive-skip-gdocs",
+            // Keep the remote backup folder out of the sync itself.
+            "--exclude", "/\(backupFolderName)/**"
+        ]
+    }
+
+    private static func backupStamp() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd_HHmmss"
+        return formatter.string(from: Date())
+    }
+
+    /// Where bisync moves local files it deletes or overwrites.
+    private static func localBackupPath(backupName: String) -> String {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return support
+            .appendingPathComponent("GoogleDriveSync/Backups", isDirectory: true)
+            .appendingPathComponent(backupName, isDirectory: true)
+            .appendingPathComponent(backupStamp(), isDirectory: true)
+            .path
+    }
+
+    /// Where remote files a sync deletes or overwrites are moved, e.g. "gdrive:_DriveSync Backups/Documents/2026-10-26_181500".
+    private static func remoteBackupPath(remote: String, backupName: String) -> String {
+        let remoteName = remote.split(separator: ":", maxSplits: 1).first.map(String.init) ?? remote
+        return "\(remoteName):\(backupFolderName)/\(backupName)/\(backupStamp())"
+    }
+
+    private static func checkLocalFolder(_ path: String) throws {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw RcloneError.unsafeLocalFolder("\(path) was not found.")
+        }
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: path)) ?? []
+        guard contents.contains(where: { $0 != ".DS_Store" }) else {
+            throw RcloneError.unsafeLocalFolder("\(path) is empty.")
+        }
+    }
+
+    /// Turns rclone's log into the lines that explain a failure, instead of only its final summary.
+    static func errorSummary(_ output: String) -> String {
+        let ansi = try? NSRegularExpression(pattern: "\u{1B}\\[[0-9;]*m")
+        let timestamp = try? NSRegularExpression(pattern: #"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} "#)
+
+        var lines: [String] = []
+        for rawLine in output.components(separatedBy: .newlines) {
+            var line = rawLine
+            for regex in [ansi, timestamp].compactMap({ $0 }) {
+                line = regex.stringByReplacingMatches(in: line, range: NSRange(line.startIndex..., in: line), withTemplate: "")
+            }
+            // Progress output can share a line with the error, so start at the ERROR marker.
+            if let range = line.range(of: "ERROR : ") {
+                line = String(line[range.lowerBound...]).trimmingCharacters(in: .whitespaces)
+                if !lines.contains(line) {
+                    lines.append(line)
+                }
+            }
+        }
+
+        if lines.isEmpty {
+            return output.components(separatedBy: .newlines)
+                .last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? output
+        }
+        return lines.prefix(3).joined(separator: "\n")
+    }
+
     private func parseFileCount(from output: String) -> Int {
         // Parse "Transferred: X / Y, 100%" pattern
         let pattern = #"Transferred:\s+(\d+)"#

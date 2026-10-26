@@ -309,6 +309,8 @@ struct AddFolderSheet: View {
                     Text("Leave empty to sync to the root.\nOr type a folder path (e.g. 'Backups/MyMac').")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+
+                    RootRemoteWarning(remotePath: remotePath, syncMode: syncMode)
                 }
                 
                 Section {
@@ -400,6 +402,27 @@ struct AddFolderSheet: View {
     }
 }
 
+// MARK: - Root Remote Warning
+
+/// Shown when a folder syncs with the whole remote, where the effect reaches far beyond one folder.
+struct RootRemoteWarning: View {
+    let remotePath: String
+    let syncMode: SyncMode
+
+    var body: some View {
+        if remotePath.trimmingCharacters(in: .whitespaces).isEmpty {
+            Label(
+                syncMode == .bisync
+                    ? "Everything in your Drive will be downloaded into this folder."
+                    : "Anything in your Drive that isn't in this folder will be removed.",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(.orange)
+        }
+    }
+}
+
 // MARK: - Edit Folder Sheet
 
 struct EditFolderSheet: View {
@@ -440,6 +463,8 @@ struct EditFolderSheet: View {
                     
                     TextField("Remote Path", text: $remotePath)
                         .textFieldStyle(.roundedBorder)
+
+                    RootRemoteWarning(remotePath: remotePath, syncMode: syncMode)
                 }
 
                 Section {
