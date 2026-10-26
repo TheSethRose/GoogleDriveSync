@@ -1,0 +1,27 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          xcodebuild -project GoogleDriveSync.xcodeproj -target GoogleDriveSync \
+            -configuration Release ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+
+      # Unsigned and without rclone; both are added on the Mac that installs it.
+      - name: Package
+        run: ditto -c -k --keepParent build/Release/GoogleDriveSync.app GoogleDriveSync.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GoogleDriveSync
+          path: GoogleDriveSync.zip
