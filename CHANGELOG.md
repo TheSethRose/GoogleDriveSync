@@ -12,8 +12,14 @@ All notable changes to this project will be documented in this file.
 - **Clearer errors**: the menu shows rclone's actual error lines instead of only its summary.
 - **Account rename** keeps every remote setting and no longer passes the OAuth token on the command line.
 
+- **Progress bar** fills only while files transfer; listing and comparing show live counts instead of a stuck 100%.
+- **Last sync time** in the menu reads as a short relative time with the full date on hover.
+
 ### Added
 - A warning when a folder syncs with the root of the remote.
+- **Per-folder sync intervals**: each folder can follow the default or set its own interval in its Add/Edit sheet.
+- **Live sync**: watches the folder and syncs about 30 seconds after local changes settle, and checks the remote every 5 minutes.
+- A 5-minute interval option.
 
 ## [1.1.3] - 2026-03-10
 

@@ -9,6 +9,8 @@ import Foundation
 
 enum SyncInterval: Codable, Equatable, Hashable, CaseIterable {
     case manual
+    case live
+    case minutes5
     case minutes15
     case minutes30
     case hourly
@@ -16,12 +18,14 @@ enum SyncInterval: Codable, Equatable, Hashable, CaseIterable {
     case custom(minutes: Int)
     
     static var allCases: [SyncInterval] {
-        [.manual, .minutes15, .minutes30, .hourly, .daily]
+        [.manual, .live, .minutes5, .minutes15, .minutes30, .hourly, .daily]
     }
     
     var displayName: String {
         switch self {
         case .manual: return "Manual Only"
+        case .live: return "Live"
+        case .minutes5: return "Every 5 minutes"
         case .minutes15: return "Every 15 minutes"
         case .minutes30: return "Every 30 minutes"
         case .hourly: return "Every Hour"
@@ -30,9 +34,26 @@ enum SyncInterval: Codable, Equatable, Hashable, CaseIterable {
         }
     }
     
+    /// Compact label for folder badges.
+    var shortName: String {
+        switch self {
+        case .manual: return "Manual"
+        case .live: return "Live"
+        case .minutes5: return "5 min"
+        case .minutes15: return "15 min"
+        case .minutes30: return "30 min"
+        case .hourly: return "Hourly"
+        case .daily: return "Daily"
+        case .custom(let minutes): return "\(minutes) min"
+        }
+    }
+
     var intervalSeconds: TimeInterval? {
         switch self {
         case .manual: return nil
+        // Live syncs on local changes; this is how often it checks Drive for changes made elsewhere.
+        case .live: return 5 * 60
+        case .minutes5: return 5 * 60
         case .minutes15: return 15 * 60
         case .minutes30: return 30 * 60
         case .hourly: return 60 * 60

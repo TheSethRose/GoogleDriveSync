@@ -202,13 +202,18 @@ struct FolderSettingsRow: View {
                         .font(.system(size: 14, weight: .semibold))
                         .lineLimit(1)
 
-                    Text(folder.syncMode == .bisync ? "Two-way" : "One-way")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(Color.secondary.opacity(0.12))
-                        .clipShape(Capsule())
+                    ForEach([
+                        folder.syncMode == .bisync ? "Two-way" : "One-way",
+                        syncManager.effectiveInterval(for: folder).shortName
+                    ], id: \.self) { badge in
+                        Text(badge)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.secondary.opacity(0.12))
+                            .clipShape(Capsule())
+                    }
                 }
 
                 Text(folder.localPath)
@@ -277,6 +282,7 @@ struct AddFolderSheet: View {
     @State private var remotePath: String = ""
     @State private var ignoredPatternsText: String = ""
     @State private var syncMode: SyncMode = .sync
+    @State private var syncInterval: SyncInterval?
     
     var body: some View {
         VStack(spacing: 20) {
@@ -334,6 +340,12 @@ struct AddFolderSheet: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
+                    Picker("Sync Interval", selection: $syncInterval) {
+                        Text("Default (\(syncManager.settings.syncInterval.displayName))").tag(nil as SyncInterval?)
+                        ForEach(SyncInterval.allCases, id: \.self) { interval in
+                            Text(interval.displayName).tag(interval as SyncInterval?)
+                        }
+                    }
                 } header: {
                     Text("Sync Mode")
                 }
@@ -375,10 +387,10 @@ struct AddFolderSheet: View {
                             remoteName: remote.name,
                             remotePath: remotePath,
                             ignoredPatterns: parsedPatterns,
-                            syncMode: syncMode
+                            syncMode: syncMode,
+                            syncInterval: syncInterval
                         )
-                        syncManager.folders.append(folder)
-                        syncManager.saveFolders()
+                        syncManager.addFolder(folder)
                         dismiss()
                     }
                 }
@@ -387,7 +399,7 @@ struct AddFolderSheet: View {
             }
         }
         .padding()
-        .frame(width: 450, height: 450)
+        .frame(width: 450, height: 500)
     }
     
     private func selectFolder() {
@@ -435,6 +447,7 @@ struct EditFolderSheet: View {
     @State private var remotePath: String = ""
     @State private var ignoredPatternsText: String = ""
     @State private var syncMode: SyncMode = .sync
+    @State private var syncInterval: SyncInterval?
     
     var body: some View {
         VStack(spacing: 20) {
@@ -488,6 +501,12 @@ struct EditFolderSheet: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
+                    Picker("Sync Interval", selection: $syncInterval) {
+                        Text("Default (\(syncManager.settings.syncInterval.displayName))").tag(nil as SyncInterval?)
+                        ForEach(SyncInterval.allCases, id: \.self) { interval in
+                            Text(interval.displayName).tag(interval as SyncInterval?)
+                        }
+                    }
                 } header: {
                     Text("Sync Mode")
                 }
@@ -524,6 +543,7 @@ struct EditFolderSheet: View {
                         updated.remoteName = remote.name
                         updated.remotePath = remotePath
                         updated.syncMode = syncMode
+                        updated.syncInterval = syncInterval
                         
                         updated.ignoredPatterns = ignoredPatternsText
                             .components(separatedBy: .newlines)
@@ -539,13 +559,14 @@ struct EditFolderSheet: View {
             }
         }
         .padding()
-        .frame(width: 450, height: 450)
+        .frame(width: 450, height: 500)
         .onAppear {
             localPath = folder.localPath
             remotePath = folder.remotePath
             selectedRemote = syncManager.availableRemotes.first { $0.name == folder.remoteName }
             ignoredPatternsText = folder.ignoredPatterns.joined(separator: "\n")
             syncMode = folder.syncMode
+            syncInterval = folder.syncInterval
         }
     }
     
@@ -877,7 +898,7 @@ struct GeneralSettingsView: View {
     var body: some View {
         Form {
             Section {
-                Picker("Sync Interval", selection: $syncManager.settings.syncInterval) {
+                Picker("Default Interval", selection: $syncManager.settings.syncInterval) {
                     ForEach(SyncInterval.allCases, id: \.self) { interval in
                         Text(interval.displayName).tag(interval)
                     }

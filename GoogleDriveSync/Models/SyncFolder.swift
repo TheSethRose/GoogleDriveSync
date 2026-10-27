@@ -47,6 +47,8 @@ struct SyncFolder: Identifiable, Codable, Equatable {
     var ignoredPatterns: [String]
     var syncMode: SyncMode
     var bisyncState: BisyncState
+    /// nil follows the default interval in Settings.
+    var syncInterval: SyncInterval?
     
     init(
         id: UUID = UUID(),
@@ -59,7 +61,8 @@ struct SyncFolder: Identifiable, Codable, Equatable {
         lastError: String? = nil,
         ignoredPatterns: [String] = [],
         syncMode: SyncMode = .sync,
-        bisyncState: BisyncState = .uninitialized
+        bisyncState: BisyncState = .uninitialized,
+        syncInterval: SyncInterval? = nil
     ) {
         self.id = id
         self.localPath = localPath
@@ -72,6 +75,7 @@ struct SyncFolder: Identifiable, Codable, Equatable {
         self.ignoredPatterns = ignoredPatterns
         self.syncMode = syncMode
         self.bisyncState = bisyncState
+        self.syncInterval = syncInterval
     }
     
     enum CodingKeys: String, CodingKey {
@@ -86,6 +90,7 @@ struct SyncFolder: Identifiable, Codable, Equatable {
         case ignoredPatterns
         case syncMode
         case bisyncState
+        case syncInterval
     }
     
     init(from decoder: Decoder) throws {
@@ -102,6 +107,7 @@ struct SyncFolder: Identifiable, Codable, Equatable {
         // Take care of UserDefaults
         self.syncMode = try container.decodeIfPresent(SyncMode.self, forKey: .syncMode) ?? .sync
         self.bisyncState = try container.decodeIfPresent(BisyncState.self,forKey: .bisyncState) ?? .uninitialized
+        self.syncInterval = try container.decodeIfPresent(SyncInterval.self, forKey: .syncInterval)
     }
     
     var displayName: String {

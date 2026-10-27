@@ -138,7 +138,7 @@ struct MenuBarView: View {
                         } label: {
                             HStack(alignment: .top, spacing: 8) {
                                 Image(systemName: "exclamationmark.triangle.fill")
-                                    .foregroundStyle(.yellow)
+                                    .foregroundStyle(.red)
                                     .font(.system(size: 12))
                                 
                                 VStack(alignment: .leading, spacing: 2) {
@@ -180,7 +180,7 @@ struct MenuBarView: View {
             return .red
         } else if syncManager.isSyncing {
             return .orange
-        } else if syncManager.folders.contains(where: { $0.lastSyncStatus == .error }) {
+        } else if syncManager.enabledFolders.contains(where: { $0.lastSyncStatus == .error }) {
             return .red
         } else {
             return .green
@@ -231,11 +231,11 @@ struct MenuBarView: View {
                 .font(.largeTitle)
                 .foregroundStyle(.secondary)
             
-            Text("No folders configured")
+            Text(syncManager.folders.isEmpty ? "No folders configured" : "No folders enabled")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-            
-            Button("Add Folder") {
+
+            Button(syncManager.folders.isEmpty ? "Add Folder" : "Open Settings") {
                 openSettings()
             }
             .buttonStyle(.borderedProminent)
@@ -261,39 +261,48 @@ struct MenuBarView: View {
     }
     
     private var actionsSection: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: 2) {
             Button {
                 Task {
                     await syncManager.syncAll()
                 }
             } label: {
-                Label("Sync All", systemImage: "arrow.triangle.2.circlepath")
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                menuRowLabel("Sync All", systemImage: "arrow.triangle.2.circlepath")
             }
             .buttonStyle(.plain)
-            .disabled(syncManager.isSyncing || syncManager.folders.isEmpty)
-            
+            .disabled(syncManager.isSyncing || syncManager.enabledFolders.isEmpty)
+
             Button {
                 NSApp.activate(ignoringOtherApps: true)
                 openSettings()
             } label: {
-                Label("Settings...", systemImage: "gear")
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                menuRowLabel("Settings…", systemImage: "gearshape")
             }
             .buttonStyle(.plain)
             .keyboardShortcut(",", modifiers: .command)
         }
     }
-    
+
     private var footerSection: some View {
         Button {
             NSApplication.shared.terminate(nil)
         } label: {
-            Label("Quit GoogleDriveSync", systemImage: "power")
-                .frame(maxWidth: .infinity, alignment: .leading)
+            menuRowLabel("Quit GoogleDriveSync", systemImage: "power")
         }
         .buttonStyle(.plain)
         .keyboardShortcut("q", modifiers: .command)
+    }
+
+    /// Full-width row so the whole line is clickable, with icons sharing one column.
+    private func menuRowLabel(_ title: String, systemImage: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: systemImage)
+                .frame(width: 18)
+            Text(title)
+            Spacer()
+        }
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
     }
 }
 
@@ -320,10 +329,14 @@ struct FolderRowView: View {
             
             Spacer()
             
-            if let lastSync = folder.lastSyncDate {
-                Text(lastSync, style: .relative)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+            if folder.lastSyncStatus != .syncing, let lastSync = folder.lastSyncDate {
+                TimelineView(.periodic(from: .now, by: 60)) { _ in
+                    Text(lastSync, format: .relative(presentation: .named, unitsStyle: .abbreviated))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                .help("Last synced \(lastSync.formatted(date: .abbreviated, time: .shortened))")
             }
             
             // Dropdown menu
@@ -362,10 +375,10 @@ struct FolderRowView: View {
             .menuIndicator(.hidden)
             .frame(width: 20)
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
         .padding(.horizontal, 8)
         .background(Color.primary.opacity(0.05))
-        .cornerRadius(6)
+        .cornerRadius(8)
     }
     
     private var statusIcon: some View {

@@ -83,6 +83,9 @@ class SyncManager: ObservableObject {
     
     private var rclone: RcloneWrapper!
     private var syncTimer: Timer?
+    private var watchers: [UUID: FolderWatcher] = [:]
+    private var localChangeDates: [UUID: Date] = [:]
+    private var lastAttemptDates: [UUID: Date] = [:]
     private let userDefaultsKey = "DriveSync.Folders"
     private let settingsKey = "DriveSync.Settings"
     
@@ -151,7 +154,7 @@ class SyncManager: ObservableObject {
         // Update launch at login
         updateLaunchAtLogin()
         
-        // Restart timer with new interval
+        // Pick up a new default interval
         scheduleSync()
     }
     
@@ -265,11 +268,19 @@ class SyncManager: ObservableObject {
         )
         folders.append(folder)
         saveFolders()
+        refreshWatchers()
     }
     
+    func addFolder(_ folder: SyncFolder) {
+        folders.append(folder)
+        saveFolders()
+        refreshWatchers()
+    }
+
     func removeFolder(_ folder: SyncFolder) {
         folders.removeAll { $0.id == folder.id }
         saveFolders()
+        refreshWatchers()
     }
     
     func updateFolder(_ folder: SyncFolder) {
@@ -295,6 +306,7 @@ class SyncManager: ObservableObject {
 
         folders[index] = updatedFolder
         saveFolders()
+        refreshWatchers()
     }
     
     /// Open the folder in the provider's web interface (if supported) or just open the browser
@@ -335,13 +347,33 @@ class SyncManager: ObservableObject {
     // MARK: - Sync Operations
     
     func syncAll() async {
-        guard !isSyncing else { return }
+        await runSync(folderIDs: enabledFolders.map(\.id), notifyOnSuccess: true)
+    }
+
+    /// Cancel the current sync operation
+    func cancelSync() {
+        guard isSyncing else { return }
+        syncCancelled = true
+        syncProgress = "Cancelling..."
+        
+        // Terminate the rclone process immediately
+        Task {
+            await rclone.cancelCurrentOperation()
+        }
+    }
+    
+    func syncFolder(_ folder: SyncFolder) async {
+        await runSync(folderIDs: [folder.id], notifyOnSuccess: false)
+    }
+
+    /// Syncs the folders one at a time. rclone runs a single process at a time, so syncs never overlap.
+    private func runSync(folderIDs: [UUID], notifyOnSuccess: Bool) async {
+        // With nothing to sync, don't record a "last sync".
+        guard !isSyncing, !folderIDs.isEmpty else { return }
         syncCancelled = false
         isSyncing = true
 
-        let folderIDs = folders
-            .filter { $0.isEnabled }
-            .map { $0.id }
+        let previouslyFailed = Set(folders.filter { $0.lastSyncStatus == .error }.map(\.id))
 
         for folderID in folderIDs {
             guard !syncCancelled else {
@@ -356,6 +388,8 @@ class SyncManager: ObservableObject {
 
             currentSyncFolder = folders[index]
             folders[index].lastSyncStatus = .syncing
+            // Changes made from here on are picked up by the next run.
+            localChangeDates[folderID] = nil
             
             let localPath = folders[index].localPath
             let remotePath = folders[index].fullRemotePath
@@ -379,11 +413,7 @@ class SyncManager: ObservableObject {
                         backupName: backupName
                     ) { [weak self] progress in
                         Task { @MainActor in
-                            self?.syncProgress =
-                                self?.simplifyProgress(progress) ?? progress
-
-                            self?.syncProgressPercent =
-                                self?.parseProgressPercent(from: progress)
+                            self?.updateProgress(from: progress)
                         }
                     }
 
@@ -403,11 +433,7 @@ class SyncManager: ObservableObject {
                         mode: mode
                     ) { [weak self] progress in
                         Task { @MainActor in
-                            self?.syncProgress =
-                                self?.simplifyProgress(progress) ?? progress
-
-                            self?.syncProgressPercent =
-                                self?.parseProgressPercent(from: progress)
+                            self?.updateProgress(from: progress)
                         }
                     }
                 }
@@ -465,6 +491,9 @@ class SyncManager: ObservableObject {
                     folders[currentIndex].lastError = error.localizedDescription
                 }
             }
+
+            // Failed and cancelled runs also wait a full interval before the scheduler retries.
+            lastAttemptDates[folderID] = Date()
         }
 
         let wasCancelled = syncCancelled
@@ -480,143 +509,18 @@ class SyncManager: ObservableObject {
 
         saveFolders()
 
-        if !wasCancelled {
+        guard !wasCancelled else { return }
+        if notifyOnSuccess {
             await sendSyncNotification(folders)
-        }
-    }
-
-    /// Cancel the current sync operation
-    func cancelSync() {
-        guard isSyncing else { return }
-        syncCancelled = true
-        syncProgress = "Cancelling..."
-        
-        // Terminate the rclone process immediately
-        Task {
-            await rclone.cancelCurrentOperation()
-        }
-    }
-    
-    func syncFolder(_ folder: SyncFolder) async {
-        guard !isSyncing else { return }
-
-        let folderID = folder.id
-        guard let index = folders.firstIndex(where:{ $0.id == folderID }) else { return }
-        
-        syncCancelled = false
-        isSyncing = true
-        currentSyncFolder = folders[index]
-        folders[index].lastSyncStatus = .syncing
-        
-        let localPath = folders[index].localPath
-        let remotePath = folders[index].fullRemotePath
-        let ignoredPatterns = folders[index].ignoredPatterns
-        let syncMode = folders[index].syncMode
-        let bisyncState = folders[index].bisyncState
-        let backupName = folders[index].backupName
-
-        // Resolve the actual local path (handling Volume-1 issues)
-        let resolvedPath = resolveLocalPath(localPath)
-        
-        do {
-            let result: SyncResult
-
-            switch syncMode {
-            case .sync:
-                result = try await rclone.sync(
-                    source: resolvedPath,
-                    destination: remotePath,
-                    ignoredPatterns: ignoredPatterns,
-                    backupName: backupName
-                ) { [weak self] progress in
-                    Task { @MainActor in
-                        self?.syncProgress =
-                            self?.simplifyProgress(progress) ?? progress
-
-                        self?.syncProgressPercent =
-                            self?.parseProgressPercent(from: progress)
-                    }
-                }
-
-            case .bisync:
-                let mode: BisyncMode
-                switch bisyncState {
-                case .uninitialized: mode = .initial
-                case .ready: mode = .normal
-                case .needsResync: mode = .resync
-                }
-
-                result = try await rclone.bidirectionalSync(
-                    local: resolvedPath,
-                    remote: remotePath,
-                    ignoredPatterns: ignoredPatterns,
-                    backupName: backupName,
-                    mode: mode
-                ) { [weak self] progress in
-                    Task { @MainActor in
-                        self?.syncProgress =
-                            self?.simplifyProgress(progress) ?? progress
-
-                        self?.syncProgressPercent =
-                            self?.parseProgressPercent(from: progress)
-                    }
-                }
+        } else {
+            // Scheduled runs only notify when a folder starts failing, not on every retry.
+            let newFailures = folders.filter {
+                folderIDs.contains($0.id) && $0.lastSyncStatus == .error && !previouslyFailed.contains($0.id)
             }
-            
-            if let currentIndex = folders.firstIndex(where: {$0.id == folderID}) {
-                let configurationUnchanged =
-                    folders[currentIndex].localPath == localPath &&
-                    folders[currentIndex].fullRemotePath == remotePath &&
-                    folders[currentIndex].ignoredPatterns == ignoredPatterns &&
-                    folders[currentIndex].syncMode == syncMode
-
-                if result.success && syncMode == .bisync && configurationUnchanged {
-                    folders[currentIndex].bisyncState = .ready
-                }
-
-                folders[currentIndex].lastSyncDate = Date()
-                folders[currentIndex].lastSyncStatus = result.success ? .success : .error
-                folders[currentIndex].lastError = nil
-            }
-            
-        } catch {
-            if let currentIndex = folders.firstIndex(where: {$0.id == folderID}) {
-                if syncCancelled {
-                    folders[currentIndex].lastSyncStatus = .idle
-                    folders[currentIndex].lastError = nil
-                } else {
-                    let configurationUnchanged =
-                        folders[currentIndex].localPath == localPath &&
-                        folders[currentIndex].fullRemotePath == remotePath &&
-                        folders[currentIndex].ignoredPatterns == ignoredPatterns &&
-                        folders[currentIndex].syncMode == syncMode
-
-                    if syncMode == .bisync,
-                       configurationUnchanged,
-                       let rcloneError = error as? RcloneError,
-                       case .bisyncNeedsResync(_) = rcloneError {
-
-                        folders[currentIndex].bisyncState = .needsResync
-                    }
-
-                    folders[currentIndex].lastSyncStatus = .error
-                    folders[currentIndex].lastError = error.localizedDescription
-                }
+            if !newFailures.isEmpty {
+                await sendSyncNotification(newFailures)
             }
         }
-        
-        let wasCancelled = syncCancelled
-        currentSyncFolder = nil
-        syncProgress = ""
-        syncProgressPercent = nil
-        syncCancelled = false
-        isSyncing = false
-
-        if !wasCancelled {
-            lastSyncDate = Date()
-        }
-
-        saveFolders()
     }
     
     /// Resolve correct path for Volumes that might have a suffix (e.g. /Volumes/Name-1)
@@ -672,120 +576,162 @@ class SyncManager: ObservableObject {
         return path
     }
     
-    /// Parse percentage from rclone progress output
-    private func parseProgressPercent(from output: String) -> Double? {
-        // rclone outputs progress like: "Transferred: 5 / 10, 50%" or just "50%"
-        let pattern = #"(\d+)%"#
-        if let regex = try? NSRegularExpression(pattern: pattern),
-           let match = regex.firstMatch(in: output, range: NSRange(output.startIndex..., in: output)),
-           let range = Range(match.range(at: 1), in: output),
-           let percent = Double(output[range]) {
-            return percent / 100.0
+    /// Update the menu's progress from a chunk of rclone `--progress` output.
+    /// The bar fills only while files are transferring; listing and comparing show an indeterminate bar.
+    private func updateProgress(from output: String) {
+        guard let summary = Self.progressSummary(from: output) else { return }
+        syncProgress = summary.text
+        syncProgressPercent = summary.percent
+    }
+
+    /// Reads the latest stats block, e.g.
+    /// "Transferred: 4.4 KiB / 13.5 KiB, 33%, 0 B/s, ETA 2s" and "Checks: 56035 / 56035, 100%, Listed 122518".
+    nonisolated static func progressSummary(from output: String) -> (text: String, percent: Double?)? {
+        func lastMatch(_ pattern: String) -> [String]? {
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.matches(in: output, range: NSRange(output.startIndex..., in: output)).last else {
+                return nil
+            }
+            return (1..<match.numberOfRanges).map { index in
+                Range(match.range(at: index), in: output).map { String(output[$0]) } ?? ""
+            }
+        }
+
+        if let bytes = lastMatch(#"Transferred:\s+([\d.]+ ?[KMGT]?i?B) / ([\d.]+ ?[KMGT]?i?B), (\d+)%(?:.*?ETA ([\w.]+))?"#),
+           let percent = Double(bytes[2]), percent < 100 {
+            var text = "\(bytes[0]) of \(bytes[1])"
+            if !bytes[3].isEmpty && bytes[3] != "-" {
+                text += " · ETA \(bytes[3])"
+            }
+            return (text, percent / 100)
+        }
+
+        let checked = lastMatch(#"Checks:\s+(\d+) /"#).flatMap { Int($0[0]) } ?? 0
+        let listed = lastMatch(#"Listed (\d+)"#).flatMap { Int($0[0]) } ?? 0
+        if checked > 0 {
+            return ("Comparing · \(checked.formatted()) checked", nil)
+        }
+        if listed > 0 {
+            return ("Listing · \(listed.formatted()) files", nil)
         }
         return nil
     }
     
-    /// Simplify rclone progress output to just show transferred/total and ETA
-    /// Input: "5.459 MiB / 6.622 MiB, 82%, ... 63 KiB/s, ETA 2s (xfr#20/29)"
-    /// Output: "5.5 / 6.6 MiB • ETA 2s"
-    private func simplifyProgress(_ progress: String) -> String {
-        var transferred = ""
-        var total = ""
-        var unit = ""
-        var eta = ""
-        
-        // Extract transferred/total bytes (e.g., "5.459 MiB / 6.622 MiB")
-        let bytesPattern = #"([\d.]+)\s*([\w]+)\s*/\s*([\d.]+)\s*([\w]+)"#
-        if let regex = try? NSRegularExpression(pattern: bytesPattern),
-           let match = regex.firstMatch(in: progress, range: NSRange(progress.startIndex..., in: progress)) {
-            if let range1 = Range(match.range(at: 1), in: progress),
-               let range3 = Range(match.range(at: 3), in: progress),
-               let range4 = Range(match.range(at: 4), in: progress) {
-                let t = Double(progress[range1]) ?? 0
-                let tot = Double(progress[range3]) ?? 0
-                transferred = String(format: "%.1f", t)
-                total = String(format: "%.1f", tot)
-                unit = String(progress[range4])
-            }
-        }
-        
-        // Extract ETA (e.g., "ETA 2s" or "ETA 1m30s")
-        let etaPattern = #"ETA\s+([\w\d]+)"#
-        if let regex = try? NSRegularExpression(pattern: etaPattern),
-           let match = regex.firstMatch(in: progress, range: NSRange(progress.startIndex..., in: progress)),
-           let range = Range(match.range(at: 1), in: progress) {
-            eta = String(progress[range])
-        }
-        
-        // Build simplified string
-        if !transferred.isEmpty && !total.isEmpty {
-            var result = "\(transferred) / \(total) \(unit)"
-            if !eta.isEmpty && eta != "-" {
-                result += " • ETA \(eta)"
-            }
-            return result
-        }
-        
-        return progress
+    // MARK: - Scheduling
+
+    /// Live folders sync once local changes have been quiet this long.
+    nonisolated static let liveQuietPeriod: TimeInterval = 30
+
+    func effectiveInterval(for folder: SyncFolder) -> SyncInterval {
+        folder.syncInterval ?? settings.syncInterval
     }
-    
-    // MARK: - Timer
-    
+
     private func scheduleSync() {
         syncTimer?.invalidate()
-        
-        // For daily sync, schedule at specific time
-        if case .daily = settings.syncInterval {
-            scheduleDailySync()
-            return
-        }
-        
-        // For other intervals, use fixed interval timer
-        guard let interval = settings.syncInterval.intervalSeconds else { return }
-        
-        syncTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+        // A cheap check; it only starts rclone for folders that are due.
+        syncTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                await self?.syncAll()
+                await self?.runDueSyncs()
+            }
+        }
+        refreshWatchers()
+    }
+
+    private func runDueSyncs() async {
+        guard !isSyncing, isRcloneInstalled else { return }
+        let now = Date()
+        let due = enabledFolders
+            .filter { folder in
+                let lastRun = [folder.lastSyncDate, lastAttemptDates[folder.id]].compactMap { $0 }.max()
+                return Self.isDue(
+                    interval: effectiveInterval(for: folder),
+                    lastRun: lastRun,
+                    lastLocalChange: localChangeDates[folder.id],
+                    dailySyncTime: settings.dailySyncTime,
+                    now: now
+                )
+            }
+            // Shortest intervals first, so a long daily run doesn't hold up live folders.
+            .sorted {
+                (effectiveInterval(for: $0).intervalSeconds ?? .infinity) <
+                    (effectiveInterval(for: $1).intervalSeconds ?? .infinity)
+            }
+        await runSync(folderIDs: due.map(\.id), notifyOnSuccess: false)
+    }
+
+    nonisolated static func isDue(
+        interval: SyncInterval,
+        lastRun: Date?,
+        lastLocalChange: Date?,
+        dailySyncTime: Date,
+        now: Date,
+        calendar: Calendar = .current
+    ) -> Bool {
+        switch interval {
+        case .manual:
+            return false
+        case .live:
+            if let change = lastLocalChange, now.timeIntervalSince(change) >= liveQuietPeriod {
+                return true
+            }
+        case .daily:
+            guard let lastRun else { return true }
+            let time = calendar.dateComponents([.hour, .minute], from: dailySyncTime)
+            guard let next = calendar.nextDate(after: lastRun, matching: time, matchingPolicy: .nextTime) else {
+                return false
+            }
+            return now >= next
+        default:
+            break
+        }
+        guard let lastRun else { return true }
+        guard let seconds = interval.intervalSeconds else { return false }
+        return now.timeIntervalSince(lastRun) >= seconds
+    }
+
+    /// Watches enabled Live folders for local changes.
+    private func refreshWatchers() {
+        let liveFolders = enabledFolders.filter {
+            if case .live = effectiveInterval(for: $0) { return true }
+            return false
+        }
+        let liveIDs = Set(liveFolders.map(\.id))
+        for id in watchers.keys where !liveIDs.contains(id) {
+            watchers[id] = nil
+            localChangeDates[id] = nil
+        }
+
+        for folder in liveFolders {
+            let path = resolveLocalPath(folder.localPath)
+            let patterns = folder.ignoredPatterns
+            if let watcher = watchers[folder.id], watcher.path == path, watcher.ignoredPatterns == patterns {
+                continue
+            }
+            let id = folder.id
+            watchers[id] = FolderWatcher(path: path, ignoredPatterns: patterns) { [weak self] paths in
+                guard paths.contains(where: { !Self.isIgnoredChange($0, patterns: patterns) }) else { return }
+                Task { @MainActor in
+                    self?.localChangeDates[id] = Date()
+                }
             }
         }
     }
-    
-    /// Schedule a sync at the user's preferred daily sync time
-    private func scheduleDailySync() {
-        let calendar = Calendar.current
-        let syncTimeComponents = calendar.dateComponents([.hour, .minute], from: settings.dailySyncTime)
-        
-        // Calculate next occurrence of this time
-        var nextSyncDate: Date
-        
-        // Get today at the sync time
-        var todayComponents = calendar.dateComponents([.year, .month, .day], from: Date())
-        todayComponents.hour = syncTimeComponents.hour
-        todayComponents.minute = syncTimeComponents.minute
-        todayComponents.second = 0
-        
-        if let todayAtSyncTime = calendar.date(from: todayComponents) {
-            if todayAtSyncTime > Date() {
-                // Sync time is still coming today
-                nextSyncDate = todayAtSyncTime
-            } else {
-                // Sync time already passed, schedule for tomorrow
-                nextSyncDate = calendar.date(byAdding: .day, value: 1, to: todayAtSyncTime) ?? todayAtSyncTime
+
+    /// Mirrors the common ignore patterns ("dir/", "*.ext", "name") so ignored files don't trigger a sync.
+    nonisolated static func isIgnoredChange(_ path: String, patterns: [String]) -> Bool {
+        let components = path.split(separator: "/").map(String.init)
+        guard let name = components.last else { return true }
+        if name.hasSuffix(".partial") { return true }  // rclone's own in-progress downloads
+        return patterns.contains { raw in
+            let pattern = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+            guard !pattern.isEmpty else { return false }
+            if raw.hasSuffix("/") {
+                return components.dropLast().contains(pattern) || name == pattern
             }
-        } else {
-            // Fallback: schedule for 24 hours from now
-            nextSyncDate = Date().addingTimeInterval(24 * 60 * 60)
-        }
-        
-        let timeUntilSync = nextSyncDate.timeIntervalSince(Date())
-        
-        // Schedule one-shot timer, then reschedule after sync
-        syncTimer = Timer.scheduledTimer(withTimeInterval: timeUntilSync, repeats: false) { [weak self] _ in
-            Task { @MainActor in
-                await self?.syncAll()
-                // Reschedule for the next day
-                self?.scheduleDailySync()
+            if pattern.hasPrefix("*") {
+                return name.hasSuffix(pattern.dropFirst())
             }
+            return components.contains(pattern)
         }
     }
     
@@ -924,5 +870,62 @@ class SyncManager: ObservableObject {
         }
         
         return false
+    }
+}
+
+// MARK: - Folder Watcher
+
+/// Reports file changes under a folder using FSEvents.
+final class FolderWatcher {
+    let path: String
+    let ignoredPatterns: [String]
+    private var stream: FSEventStreamRef?
+
+    private final class Handler {
+        let onChange: ([String]) -> Void
+        init(_ onChange: @escaping ([String]) -> Void) { self.onChange = onChange }
+    }
+
+    init(path: String, ignoredPatterns: [String], onChange: @escaping ([String]) -> Void) {
+        self.path = path
+        self.ignoredPatterns = ignoredPatterns
+
+        // The stream owns the handler and releases it when the stream is released.
+        var context = FSEventStreamContext(
+            version: 0,
+            info: Unmanaged.passRetained(Handler(onChange)).toOpaque(),
+            retain: nil,
+            release: { info in
+                guard let info else { return }
+                Unmanaged<Handler>.fromOpaque(info).release()
+            },
+            copyDescription: nil
+        )
+        let callback: FSEventStreamCallback = { _, info, _, eventPaths, _, _ in
+            guard let info else { return }
+            let handler = Unmanaged<Handler>.fromOpaque(info).takeUnretainedValue()
+            let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] ?? []
+            handler.onChange(paths)
+        }
+        stream = FSEventStreamCreate(
+            nil,
+            callback,
+            &context,
+            [path] as CFArray,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            2.0,
+            FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseCFTypes)
+        )
+        if let stream {
+            FSEventStreamSetDispatchQueue(stream, DispatchQueue(label: "com.saihgupr.drivesync.watcher"))
+            FSEventStreamStart(stream)
+        }
+    }
+
+    deinit {
+        guard let stream else { return }
+        FSEventStreamStop(stream)
+        FSEventStreamInvalidate(stream)
+        FSEventStreamRelease(stream)
     }
 }

@@ -230,7 +230,7 @@ actor RcloneWrapper {
         // An empty or missing source would make sync delete everything on the remote.
         try Self.checkLocalFolder(source)
 
-        var args = ["sync", source, destination, "--progress", "--stats-one-line"]
+        var args = ["sync", source, destination, "--progress"]
         args += Self.safetyArguments()
         args += ["--backup-dir", Self.remoteBackupPath(remote: destination, backupName: backupName)]
 
@@ -277,7 +277,7 @@ actor RcloneWrapper {
         ignoredPatterns: [String] = [],
         onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> SyncResult {
-        var args = ["copy", source, destination, "--progress", "--stats-one-line"]
+        var args = ["copy", source, destination, "--progress"]
         
         for pattern in ignoredPatterns {
             let trimmed = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -329,7 +329,6 @@ actor RcloneWrapper {
             local,
             remote,
             "--progress",
-            "--stats-one-line",
             "--resilient",
             "--recover",
             "--max-lock", "2m",
