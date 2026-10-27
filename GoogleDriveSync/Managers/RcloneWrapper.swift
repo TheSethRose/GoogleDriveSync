@@ -69,6 +69,9 @@ actor RcloneWrapper {
 
     /// Folder on the remote that receives files a sync deletes or overwrites.
     static let backupFolderName = "_DriveSync Backups"
+    /// Remote folder that holds the backup folder, so it stays out of the top level of the Drive.
+    /// Syncs of this folder skip the backups through the "/_DriveSync Backups/**" exclude.
+    static let backupParentFolder = "99_Archive"
     /// Bisync asks before a run deletes more than this percentage of a folder on either side.
     static let maxDeletePercent = 50
     /// Deletes up to this count are allowed even when they exceed the percentage.
@@ -560,13 +563,13 @@ actor RcloneWrapper {
         "\(localBackupRoot(backupName: backupName))/\(stamp)"
     }
 
-    /// The remote folder holding this sync's backups, e.g. "gdrive:_DriveSync Backups/Documents-848ED13B".
+    /// The remote folder holding this sync's backups, e.g. "gdrive:99_Archive/_DriveSync Backups/Documents-848ED13B".
     private static func remoteBackupRoot(remote: String, backupName: String) -> String {
         let remoteName = remote.split(separator: ":", maxSplits: 1).first.map(String.init) ?? remote
-        return "\(remoteName):\(backupFolderName)/\(backupName)"
+        return "\(remoteName):\(backupParentFolder)/\(backupFolderName)/\(backupName)"
     }
 
-    /// Where remote files a sync deletes or overwrites are moved, e.g. "gdrive:_DriveSync Backups/Documents/2026-10-26_181500".
+    /// Where remote files a sync deletes or overwrites are moved, e.g. "gdrive:99_Archive/_DriveSync Backups/Documents/2026-10-26_181500".
     private static func remoteBackupPath(remote: String, backupName: String, stamp: String) -> String {
         "\(remoteBackupRoot(remote: remote, backupName: backupName))/\(stamp)"
     }

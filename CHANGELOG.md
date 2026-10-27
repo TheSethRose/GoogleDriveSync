@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
-- **No more permanent deletes**: files a sync deletes or overwrites are moved to `_DriveSync Backups/` on the remote and `~/Library/Application Support/GoogleDriveSync/Backups/` locally.
+- **No more permanent deletes**: files a sync deletes or overwrites are moved to `99_Archive/_DriveSync Backups/` on the remote and `~/Library/Application Support/GoogleDriveSync/Backups/` locally.
 - **Two-way sync safety**: a missing or empty local folder is never synced.
 - **Resync recovery**: the resync step now passes `--resync`; retryable errors no longer force a resync.
 - **Google Docs/Sheets** are skipped instead of failing the sync or being deleted.
