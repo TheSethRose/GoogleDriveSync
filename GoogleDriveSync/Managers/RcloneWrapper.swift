@@ -67,6 +67,8 @@ actor RcloneWrapper {
     static let backupFolderName = "_DriveSync Backups"
     /// Bisync aborts if a run would delete more than this percentage of files on either side.
     static let maxDeletePercent = 5
+    /// Deletes up to this count are allowed even when they exceed the percentage.
+    static let alwaysAllowedDeletes = 10
 
     init(rclonePath: String = AppSettings.defaultRclonePath) {
         self.rclonePath = rclonePath
@@ -365,20 +367,30 @@ actor RcloneWrapper {
         }
 
         let startTime = Date()
-        let result: ProcessResult
 
-        if let progressHandler = onProgress {
-            result = try await runner.runWithProgress(
-                rclonePath,
-                arguments: args
-            ) { output in
-                progressHandler(output)
+        func run(_ args: [String]) async throws -> ProcessResult {
+            if let progressHandler = onProgress {
+                return try await runner.runWithProgress(
+                    rclonePath,
+                    arguments: args
+                ) { output in
+                    progressHandler(output)
+                }
             }
-        } else {
-            result = try await runner.run(
+            return try await runner.run(
                 rclonePath,
                 arguments: args
             )
+        }
+
+        var result = try await run(args)
+
+        // The percentage limit alone would block any delete in a small folder (1 of 2 files is 50%).
+        // A few deletes are always allowed; they still go to the backup folders first.
+        if !result.isSuccess,
+           let count = Self.blockedDeleteCount(result.stdout + "\n" + result.stderr),
+           count <= Self.alwaysAllowedDeletes {
+            result = try await run(args + ["--force"])
         }
 
         let duration = Date().timeIntervalSince(startTime)
@@ -453,6 +465,16 @@ actor RcloneWrapper {
     }
 
     /// Turns rclone's log into the lines that explain a failure, instead of only its final summary.
+    /// The delete count from bisync's "Safety abort: too many deletes (>5%, 1 of 2)" error.
+    static func blockedDeleteCount(_ output: String) -> Int? {
+        guard let regex = try? NSRegularExpression(pattern: #"too many deletes \(>\d+%, (\d+) of \d+\)"#),
+              let match = regex.firstMatch(in: output, range: NSRange(output.startIndex..., in: output)),
+              let range = Range(match.range(at: 1), in: output) else {
+            return nil
+        }
+        return Int(output[range])
+    }
+
     static func errorSummary(_ output: String) -> String {
         let ansi = try? NSRegularExpression(pattern: "\u{1B}\\[[0-9;]*m")
         let timestamp = try? NSRegularExpression(pattern: #"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} "#)
