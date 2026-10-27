@@ -21,6 +21,8 @@ enum RcloneError: LocalizedError {
     case bisyncNeedsResync(String)
     case invalidRemote(String)
     case unsafeLocalFolder(String)
+    /// Bisync stopped before deleting more files than the safety limit allows.
+    case deletesNeedApproval(PendingDeletes)
 
     var errorDescription: String? {
         switch self {
@@ -36,6 +38,8 @@ enum RcloneError: LocalizedError {
             return "Invalid remote: \(name)"
         case .unsafeLocalFolder(let message):
             return "Skipped to protect your files: \(message)"
+        case .deletesNeedApproval(let pending):
+            return "Waiting for you: \(pending.summary)"
         }
     }
 }
@@ -65,8 +69,8 @@ actor RcloneWrapper {
 
     /// Folder on the remote that receives files a sync deletes or overwrites.
     static let backupFolderName = "_DriveSync Backups"
-    /// Bisync aborts if a run would delete more than this percentage of files on either side.
-    static let maxDeletePercent = 5
+    /// Bisync asks before a run deletes more than this percentage of a folder on either side.
+    static let maxDeletePercent = 50
     /// Deletes up to this count are allowed even when they exceed the percentage.
     static let alwaysAllowedDeletes = 10
 
@@ -234,7 +238,7 @@ actor RcloneWrapper {
 
         var args = ["sync", source, destination, "--progress"]
         args += Self.safetyArguments()
-        args += ["--backup-dir", Self.remoteBackupPath(remote: destination, backupName: backupName)]
+        args += ["--backup-dir", Self.remoteBackupPath(remote: destination, backupName: backupName, stamp: Self.backupStamp())]
 
         for pattern in ignoredPatterns {
             let trimmed = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -320,12 +324,14 @@ actor RcloneWrapper {
         ignoredPatterns: [String] = [],
         backupName: String,
         mode: BisyncMode,
+        allowDeletes: Bool = false,
         dryRun: Bool = false,
         onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> SyncResult {
         // A missing folder (e.g. an unmounted volume) must never be treated as "everything was deleted".
         try Self.checkLocalFolder(local)
 
+        let stamp = Self.backupStamp()
         var args = [
             "bisync",
             local,
@@ -336,10 +342,18 @@ actor RcloneWrapper {
             "--max-lock", "2m",
             "--conflict-resolve", "newer",
             "--max-delete", String(Self.maxDeletePercent),
-            "--backup-dir1", Self.localBackupPath(backupName: backupName),
-            "--backup-dir2", Self.remoteBackupPath(remote: remote, backupName: backupName)
+            "--backup-dir1", Self.localBackupPath(backupName: backupName, stamp: stamp),
+            "--backup-dir2", Self.remoteBackupPath(remote: remote, backupName: backupName, stamp: stamp)
         ]
+        if allowDeletes {
+            args.append("--force")
+        }
         args += Self.safetyArguments()
+
+        if mode == .initial {
+            // Bisync needs both folders to exist; a new destination may not be on the remote yet.
+            _ = try? await runner.run(rclonePath, arguments: ["mkdir", remote])
+        }
 
         if mode == .initial || mode == .resync {
             // A resync merges both sides without deleting anything.
@@ -385,11 +399,12 @@ actor RcloneWrapper {
 
         var result = try await run(args)
 
-        // The percentage limit alone would block any delete in a small folder (1 of 2 files is 50%).
-        // A few deletes are always allowed; they still go to the backup folders first.
-        if !result.isSuccess,
-           let count = Self.blockedDeleteCount(result.stdout + "\n" + result.stderr),
-           count <= Self.alwaysAllowedDeletes {
+        // The percentage limit alone would block any delete in a small folder (1 of 1 file is 100%).
+        // A few deletes are always allowed; more than that waits for the user. Either way they're backed up first.
+        if !result.isSuccess, let pending = Self.blockedDeletes(result.stdout + "\n" + result.stderr) {
+            guard pending.count <= Self.alwaysAllowedDeletes else {
+                throw RcloneError.deletesNeedApproval(pending)
+            }
             result = try await run(args + ["--force"])
         }
 
@@ -418,6 +433,91 @@ actor RcloneWrapper {
         )
     }
 
+    // MARK: - Undo and Cleanup
+
+    /// The run folders (e.g. "2026-10-26_181500") in this sync's backups, local and remote.
+    private func backupStamps(remote: String, backupName: String) async -> (local: [String], remote: [String]) {
+        let local = ((try? FileManager.default.contentsOfDirectory(atPath: Self.localBackupRoot(backupName: backupName))) ?? [])
+            .filter { Self.backupDate(fromStamp: $0) != nil }
+        let listing = try? await runner.run(rclonePath, arguments: [
+            "lsf", "--dirs-only", Self.remoteBackupRoot(remote: remote, backupName: backupName)
+        ])
+        let remoteStamps = (listing?.isSuccess == true ? listing!.stdout : "")
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "/ ")) }
+            .filter { Self.backupDate(fromStamp: $0) != nil }
+        return (local, remoteStamps)
+    }
+
+    /// The newest run that removed or replaced files, and how many files it saved.
+    func latestBackup(remote: String, backupName: String) async -> (stamp: String, fileCount: Int)? {
+        let stamps = await backupStamps(remote: remote, backupName: backupName)
+        guard let stamp = (stamps.local + stamps.remote).max() else { return nil }
+
+        var count = 0
+        if stamps.local.contains(stamp),
+           let files = FileManager.default.enumerator(atPath: Self.localBackupPath(backupName: backupName, stamp: stamp)) {
+            count += files.allObjects.compactMap { $0 as? String }
+                .filter { !$0.hasSuffix(".DS_Store") && !$0.isEmpty }
+                .filter { path in
+                    var isDirectory: ObjCBool = false
+                    FileManager.default.fileExists(
+                        atPath: Self.localBackupPath(backupName: backupName, stamp: stamp) + "/" + path,
+                        isDirectory: &isDirectory
+                    )
+                    return !isDirectory.boolValue
+                }
+                .count
+        }
+        if stamps.remote.contains(stamp),
+           let listing = try? await runner.run(rclonePath, arguments: [
+               "lsf", "-R", "--files-only", Self.remoteBackupPath(remote: remote, backupName: backupName, stamp: stamp)
+           ]), listing.isSuccess {
+            count += listing.stdout.split(separator: "\n").count
+        }
+        return (stamp, count)
+    }
+
+    /// Puts back the files a run removed. Only missing files are restored, so nothing newer is overwritten.
+    /// Two-way syncs restore each side's backup to that side; one-way syncs restore into the local folder,
+    /// since the next sync would otherwise remove them from the remote again.
+    func restoreBackup(stamp: String, local: String, remote: String, backupName: String, twoWay: Bool) async throws {
+        let stamps = await backupStamps(remote: remote, backupName: backupName)
+
+        if stamps.local.contains(stamp) {
+            let result = try await runner.run(rclonePath, arguments: [
+                "copy", Self.localBackupPath(backupName: backupName, stamp: stamp), local, "--ignore-existing"
+            ])
+            guard result.isSuccess else {
+                throw RcloneError.syncFailed(Self.errorSummary(result.stdout + "\n" + result.stderr))
+            }
+        }
+        if stamps.remote.contains(stamp) {
+            let result = try await runner.run(rclonePath, arguments: [
+                "copy", Self.remoteBackupPath(remote: remote, backupName: backupName, stamp: stamp),
+                twoWay ? remote : local, "--ignore-existing", "--drive-skip-gdocs"
+            ])
+            guard result.isSuccess else {
+                throw RcloneError.syncFailed(Self.errorSummary(result.stdout + "\n" + result.stderr))
+            }
+        }
+    }
+
+    /// Deletes this sync's backup runs older than the cutoff. Remote ones go to the Drive trash.
+    func pruneBackups(remote: String, backupName: String, olderThan cutoff: Date) async {
+        let stamps = await backupStamps(remote: remote, backupName: backupName)
+        let isOld = { (stamp: String) in (Self.backupDate(fromStamp: stamp) ?? .distantFuture) < cutoff }
+
+        for stamp in stamps.local where isOld(stamp) {
+            try? FileManager.default.removeItem(atPath: Self.localBackupPath(backupName: backupName, stamp: stamp))
+        }
+        for stamp in stamps.remote where isOld(stamp) {
+            _ = try? await runner.run(rclonePath, arguments: [
+                "purge", Self.remoteBackupPath(remote: remote, backupName: backupName, stamp: stamp)
+            ])
+        }
+    }
+
     // MARK: - Helpers
 
     /// Flags shared by every sync that can delete or overwrite files.
@@ -430,27 +530,45 @@ actor RcloneWrapper {
         ]
     }
 
-    private static func backupStamp() -> String {
+    private static let stampFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd_HHmmss"
-        return formatter.string(from: Date())
+        return formatter
+    }()
+
+    private static func backupStamp() -> String {
+        stampFormatter.string(from: Date())
     }
 
-    /// Where bisync moves local files it deletes or overwrites.
-    private static func localBackupPath(backupName: String) -> String {
+    /// The date a backup folder name like "2026-10-26_181500" stands for.
+    static func backupDate(fromStamp stamp: String) -> Date? {
+        stampFormatter.date(from: stamp.trimmingCharacters(in: CharacterSet(charactersIn: "/")))
+    }
+
+    /// The folder holding this sync's local backups, one subfolder per run.
+    private static func localBackupRoot(backupName: String) -> String {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return support
             .appendingPathComponent("GoogleDriveSync/Backups", isDirectory: true)
             .appendingPathComponent(backupName, isDirectory: true)
-            .appendingPathComponent(backupStamp(), isDirectory: true)
             .path
     }
 
-    /// Where remote files a sync deletes or overwrites are moved, e.g. "gdrive:_DriveSync Backups/Documents/2026-10-26_181500".
-    private static func remoteBackupPath(remote: String, backupName: String) -> String {
+    /// Where bisync moves local files it deletes or overwrites.
+    private static func localBackupPath(backupName: String, stamp: String) -> String {
+        "\(localBackupRoot(backupName: backupName))/\(stamp)"
+    }
+
+    /// The remote folder holding this sync's backups, e.g. "gdrive:_DriveSync Backups/Documents-848ED13B".
+    private static func remoteBackupRoot(remote: String, backupName: String) -> String {
         let remoteName = remote.split(separator: ":", maxSplits: 1).first.map(String.init) ?? remote
-        return "\(remoteName):\(backupFolderName)/\(backupName)/\(backupStamp())"
+        return "\(remoteName):\(backupFolderName)/\(backupName)"
+    }
+
+    /// Where remote files a sync deletes or overwrites are moved, e.g. "gdrive:_DriveSync Backups/Documents/2026-10-26_181500".
+    private static func remoteBackupPath(remote: String, backupName: String, stamp: String) -> String {
+        "\(remoteBackupRoot(remote: remote, backupName: backupName))/\(stamp)"
     }
 
     private static func checkLocalFolder(_ path: String) throws {
@@ -464,17 +582,20 @@ actor RcloneWrapper {
         }
     }
 
-    /// Turns rclone's log into the lines that explain a failure, instead of only its final summary.
-    /// The delete count from bisync's "Safety abort: too many deletes (>5%, 1 of 2)" error.
-    static func blockedDeleteCount(_ output: String) -> Int? {
-        guard let regex = try? NSRegularExpression(pattern: #"too many deletes \(>\d+%, (\d+) of \d+\)"#),
+    /// Reads bisync's "Safety abort: too many deletes (>50%, 312 of 400) on Path1" error.
+    /// Path1 is the local folder: deletes found there would be carried out on the remote.
+    static func blockedDeletes(_ output: String) -> PendingDeletes? {
+        guard let regex = try? NSRegularExpression(pattern: #"too many deletes \(>\d+%, (\d+) of \d+\) on (Path[12])"#),
               let match = regex.firstMatch(in: output, range: NSRange(output.startIndex..., in: output)),
-              let range = Range(match.range(at: 1), in: output) else {
+              let countRange = Range(match.range(at: 1), in: output),
+              let pathRange = Range(match.range(at: 2), in: output),
+              let count = Int(output[countRange]) else {
             return nil
         }
-        return Int(output[range])
+        return PendingDeletes(count: count, onRemote: output[pathRange] == "Path1")
     }
 
+    /// Turns rclone's log into the lines that explain a failure, instead of only its final summary.
     static func errorSummary(_ output: String) -> String {
         let ansi = try? NSRegularExpression(pattern: "\u{1B}\\[[0-9;]*m")
         let timestamp = try? NSRegularExpression(pattern: #"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} "#)
@@ -553,5 +674,16 @@ struct SyncResult {
         formatter.allowedUnits = [.hour, .minute, .second]
         formatter.unitsStyle = .abbreviated
         return formatter.string(from: duration) ?? "\(Int(duration))s"
+    }
+}
+
+/// Deletes bisync held back for the user to allow or undo.
+struct PendingDeletes: Codable, Equatable {
+    let count: Int
+    /// true when files removed on this Mac would be deleted from the remote.
+    let onRemote: Bool
+
+    var summary: String {
+        "wants to delete \(count) file\(count == 1 ? "" : "s") \(onRemote ? "from Drive" : "from this Mac")"
     }
 }

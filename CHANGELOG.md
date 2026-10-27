@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - **No more permanent deletes**: files a sync deletes or overwrites are moved to `_DriveSync Backups/` on the remote and `~/Library/Application Support/GoogleDriveSync/Backups/` locally.
-- **Two-way sync safety**: bisync stops if a run would delete more than 5% of files (beyond 10 deletes, so small folders can still be cleaned out), and a missing or empty local folder is never synced.
+- **Two-way sync safety**: a missing or empty local folder is never synced.
 - **Resync recovery**: the resync step now passes `--resync`; retryable errors no longer force a resync.
 - **Google Docs/Sheets** are skipped instead of failing the sync or being deleted.
 - **Clearer errors**: the menu shows rclone's actual error lines instead of only its summary.
@@ -20,6 +20,10 @@ All notable changes to this project will be documented in this file.
 - **Per-folder sync intervals**: each folder can follow the default or set its own interval in its Add/Edit sheet.
 - **Live sync**: watches the folder and syncs about 30 seconds after local changes settle, and checks the remote every 5 minutes.
 - A 5-minute interval option.
+- **Ask before large deletes**: when a run would delete more than half of a folder (and more than 10 files), that folder pauses and the menu asks to **Allow** or **Put Back**. Everyday deletes sync without asking.
+- **Undo Last Sync** in each folder's menu restores the files the newest run removed, without overwriting newer versions.
+- **Backup cleanup**: backups older than 90 days are deleted once a day.
+- New two-way folders create their destination on the remote if it doesn't exist.
 
 ## [1.1.3] - 2026-03-10
 

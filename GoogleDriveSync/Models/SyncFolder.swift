@@ -49,6 +49,8 @@ struct SyncFolder: Identifiable, Codable, Equatable {
     var bisyncState: BisyncState
     /// nil follows the default interval in Settings.
     var syncInterval: SyncInterval?
+    /// Set while a two-way sync waits for the user to allow or undo a large delete.
+    var pendingDeletes: PendingDeletes?
     
     init(
         id: UUID = UUID(),
@@ -91,6 +93,7 @@ struct SyncFolder: Identifiable, Codable, Equatable {
         case syncMode
         case bisyncState
         case syncInterval
+        case pendingDeletes
     }
     
     init(from decoder: Decoder) throws {
@@ -108,6 +111,7 @@ struct SyncFolder: Identifiable, Codable, Equatable {
         self.syncMode = try container.decodeIfPresent(SyncMode.self, forKey: .syncMode) ?? .sync
         self.bisyncState = try container.decodeIfPresent(BisyncState.self,forKey: .bisyncState) ?? .uninitialized
         self.syncInterval = try container.decodeIfPresent(SyncInterval.self, forKey: .syncInterval)
+        self.pendingDeletes = try container.decodeIfPresent(PendingDeletes.self, forKey: .pendingDeletes)
     }
     
     var displayName: String {

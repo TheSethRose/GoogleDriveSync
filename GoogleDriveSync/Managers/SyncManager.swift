@@ -66,8 +66,11 @@ class SyncManager: ObservableObject {
             }
             return "Syncing..."
         } else {
-            let errorCount = enabledFolders.filter { $0.lastSyncStatus == .error }.count
-            if errorCount > 0 {
+            let waitingCount = enabledFolders.filter { $0.pendingDeletes != nil }.count
+            let errorCount = enabledFolders.filter { $0.lastSyncStatus == .error && $0.pendingDeletes == nil }.count
+            if waitingCount > 0 {
+                return "\(waitingCount) folder\(waitingCount == 1 ? " needs" : "s need") your OK"
+            } else if errorCount > 0 {
                 return "\(errorCount) folder\(errorCount == 1 ? "" : "s") failed to sync"
             } else if let lastSync = lastSyncDate {
                 let formatter = RelativeDateTimeFormatter()
@@ -367,13 +370,14 @@ class SyncManager: ObservableObject {
     }
 
     /// Syncs the folders one at a time. rclone runs a single process at a time, so syncs never overlap.
-    private func runSync(folderIDs: [UUID], notifyOnSuccess: Bool) async {
+    private func runSync(folderIDs: [UUID], notifyOnSuccess: Bool, allowDeletes: Bool = false) async {
         // With nothing to sync, don't record a "last sync".
         guard !isSyncing, !folderIDs.isEmpty else { return }
         syncCancelled = false
         isSyncing = true
 
         let previouslyFailed = Set(folders.filter { $0.lastSyncStatus == .error }.map(\.id))
+        let previouslyWaiting = Set(folders.filter { $0.pendingDeletes != nil }.map(\.id))
 
         for folderID in folderIDs {
             guard !syncCancelled else {
@@ -390,6 +394,7 @@ class SyncManager: ObservableObject {
             folders[index].lastSyncStatus = .syncing
             // Changes made from here on are picked up by the next run.
             localChangeDates[folderID] = nil
+            folders[index].pendingDeletes = nil
             
             let localPath = folders[index].localPath
             let remotePath = folders[index].fullRemotePath
@@ -430,7 +435,8 @@ class SyncManager: ObservableObject {
                         remote: remotePath,
                         ignoredPatterns: ignoredPatterns,
                         backupName: backupName,
-                        mode: mode
+                        mode: mode,
+                        allowDeletes: allowDeletes
                     ) { [weak self] progress in
                         Task { @MainActor in
                             self?.updateProgress(from: progress)
@@ -487,6 +493,11 @@ class SyncManager: ObservableObject {
                         folders[currentIndex].bisyncState = .needsResync
                     }
 
+                    if let rcloneError = error as? RcloneError,
+                       case .deletesNeedApproval(let pending) = rcloneError {
+                        folders[currentIndex].pendingDeletes = pending
+                    }
+
                     folders[currentIndex].lastSyncStatus = .error
                     folders[currentIndex].lastError = error.localizedDescription
                 }
@@ -515,10 +526,16 @@ class SyncManager: ObservableObject {
         } else {
             // Scheduled runs only notify when a folder starts failing, not on every retry.
             let newFailures = folders.filter {
-                folderIDs.contains($0.id) && $0.lastSyncStatus == .error && !previouslyFailed.contains($0.id)
+                folderIDs.contains($0.id) && $0.lastSyncStatus == .error && $0.pendingDeletes == nil
+                    && !previouslyFailed.contains($0.id)
             }
             if !newFailures.isEmpty {
                 await sendSyncNotification(newFailures)
+            }
+        }
+        for folder in folders where folderIDs.contains(folder.id) && !previouslyWaiting.contains(folder.id) {
+            if let pending = folder.pendingDeletes {
+                await sendApprovalNotification(folder: folder, pending: pending)
             }
         }
     }
@@ -641,6 +658,8 @@ class SyncManager: ObservableObject {
         guard !isSyncing, isRcloneInstalled else { return }
         let now = Date()
         let due = enabledFolders
+            // A folder waiting on a large delete stays paused until the user answers.
+            .filter { $0.pendingDeletes == nil }
             .filter { folder in
                 let lastRun = [folder.lastSyncDate, lastAttemptDates[folder.id]].compactMap { $0 }.max()
                 return Self.isDue(
@@ -657,6 +676,7 @@ class SyncManager: ObservableObject {
                     (effectiveInterval(for: $1).intervalSeconds ?? .infinity)
             }
         await runSync(folderIDs: due.map(\.id), notifyOnSuccess: false)
+        await pruneBackupsIfDue()
     }
 
     nonisolated static func isDue(
@@ -735,7 +755,109 @@ class SyncManager: ObservableObject {
         }
     }
     
+    // MARK: - Large Deletes, Undo and Cleanup
+
+    /// Backups older than this are deleted. Remote ones then stay in the Drive trash for another 30 days.
+    static let backupRetentionDays = 90
+    private let lastCleanupKey = "DriveSync.LastBackupCleanup"
+
+    /// Carries out the deletes a folder was waiting on.
+    func allowDeletes(_ folder: SyncFolder) async {
+        await runSync(folderIDs: [folder.id], notifyOnSuccess: false, allowDeletes: true)
+    }
+
+    /// Restores the files a folder wanted to delete. A resync copies missing files both ways and deletes nothing.
+    func putBackDeletes(_ folder: SyncFolder) async {
+        guard !isSyncing, let index = folders.firstIndex(where: { $0.id == folder.id }) else { return }
+        folders[index].bisyncState = .needsResync
+        await runSync(folderIDs: [folder.id], notifyOnSuccess: false)
+    }
+
+    /// Puts back the files the newest backed-up run removed, after the user confirms.
+    func undoLastSync(_ folder: SyncFolder) async {
+        guard !isSyncing, let index = folders.firstIndex(where: { $0.id == folder.id }) else { return }
+        let target = folders[index]
+        isSyncing = true
+        currentSyncFolder = target
+        syncProgress = "Finding backups…"
+
+        let latest = await rclone.latestBackup(remote: target.fullRemotePath, backupName: target.backupName)
+        syncProgress = ""
+
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        guard let latest, latest.fileCount > 0 else {
+            isSyncing = false
+            currentSyncFolder = nil
+            alert.messageText = "Nothing to undo"
+            alert.informativeText = "No sync has removed or replaced files in \(target.displayName)."
+            alert.runModal()
+            return
+        }
+        let date = RcloneWrapper.backupDate(fromStamp: latest.stamp) ?? Date()
+        alert.messageText = "Put back \(latest.fileCount) file\(latest.fileCount == 1 ? "" : "s") in \(target.displayName)?"
+        alert.informativeText = "Restores the files the sync removed on \(date.formatted(date: .abbreviated, time: .shortened)). Files that still exist are left as they are."
+        alert.addButton(withTitle: "Put Back")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            isSyncing = false
+            currentSyncFolder = nil
+            return
+        }
+
+        syncProgress = "Putting files back…"
+        var undoError: Error?
+        do {
+            try await rclone.restoreBackup(
+                stamp: latest.stamp,
+                local: resolveLocalPath(target.localPath),
+                remote: target.fullRemotePath,
+                backupName: target.backupName,
+                twoWay: target.syncMode == .bisync
+            )
+        } catch {
+            undoError = error
+        }
+        isSyncing = false
+        currentSyncFolder = nil
+        syncProgress = ""
+
+        if let undoError, let currentIndex = folders.firstIndex(where: { $0.id == target.id }) {
+            folders[currentIndex].lastSyncStatus = .error
+            folders[currentIndex].lastError = undoError.localizedDescription
+            saveFolders()
+            return
+        }
+        // Sync now so the restored files reach the other side.
+        await runSync(folderIDs: [target.id], notifyOnSuccess: false)
+    }
+
+    /// Deletes old backups at most once a day.
+    private func pruneBackupsIfDue() async {
+        let lastCleanup = UserDefaults.standard.object(forKey: lastCleanupKey) as? Date ?? .distantPast
+        guard !isSyncing, Date().timeIntervalSince(lastCleanup) >= 24 * 60 * 60 else { return }
+        isSyncing = true
+        syncProgress = "Cleaning up old backups…"
+        let cutoff = Date().addingTimeInterval(-Double(Self.backupRetentionDays) * 24 * 60 * 60)
+        for folder in folders {
+            await rclone.pruneBackups(remote: folder.fullRemotePath, backupName: folder.backupName, olderThan: cutoff)
+        }
+        UserDefaults.standard.set(Date(), forKey: lastCleanupKey)
+        syncProgress = ""
+        isSyncing = false
+    }
+
     // MARK: - Notifications
+
+    private func sendApprovalNotification(folder: SyncFolder, pending: PendingDeletes) async {
+        guard settings.notifyOnError || settings.showNotifications else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "\(folder.displayName) is waiting for you"
+        content.body = "It \(pending.summary). Open GoogleDriveSync in the menu bar to allow it or put the files back."
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: "PENDING_DELETES_\(folder.id)", content: content, trigger: nil)
+        try? await UNUserNotificationCenter.current().add(request)
+    }
     
     private func sendSyncNotification(_ folders: [SyncFolder]) async {
         let errorCount = folders.filter { $0.lastSyncStatus == .error }.count

@@ -17,6 +17,9 @@ struct MenuBarView: View {
             // Header with status
             headerSection
             
+            // Large deletes waiting for an answer
+            approvalBanner
+
             // Error details (when present)
             errorBanner
             
@@ -123,7 +126,9 @@ struct MenuBarView: View {
     }
     
     private var errorBanner: some View {
-        let foldersWithErrors = syncManager.folders.filter { $0.isEnabled && $0.lastSyncStatus == .error }
+        let foldersWithErrors = syncManager.folders.filter {
+            $0.isEnabled && $0.lastSyncStatus == .error && $0.pendingDeletes == nil
+        }
         
         return Group {
             if !foldersWithErrors.isEmpty {
@@ -175,6 +180,52 @@ struct MenuBarView: View {
         }
     }
     
+    private var approvalBanner: some View {
+        let waiting = syncManager.enabledFolders.filter { $0.pendingDeletes != nil }
+
+        return Group {
+            if !waiting.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(waiting) { folder in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label {
+                                Text("\(folder.displayName) \(folder.pendingDeletes?.summary ?? "")")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .fixedSize(horizontal: false, vertical: true)
+                            } icon: {
+                                Image(systemName: "trash")
+                                    .foregroundStyle(.orange)
+                            }
+
+                            HStack(spacing: 6) {
+                                Button("Allow") {
+                                    Task { await syncManager.allowDeletes(folder) }
+                                }
+                                .buttonStyle(.borderedProminent)
+
+                                Button("Put Back") {
+                                    Task { await syncManager.putBackDeletes(folder) }
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                            .controlSize(.small)
+                            .disabled(syncManager.isSyncing)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(Color.orange.opacity(0.1))
+                .cornerRadius(8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.orange.opacity(0.3), lineWidth: 1)
+                )
+                .padding(.top, 8)
+            }
+        }
+    }
+
     private var statusColor: Color {
         if !syncManager.isRcloneInstalled {
             return .red
@@ -344,6 +395,13 @@ struct FolderRowView: View {
                 Button("Sync Now") {
                     Task {
                         await syncManager.syncFolder(folder)
+                    }
+                }
+                .disabled(syncManager.isSyncing)
+
+                Button("Undo Last Sync…") {
+                    Task {
+                        await syncManager.undoLastSync(folder)
                     }
                 }
                 .disabled(syncManager.isSyncing)
