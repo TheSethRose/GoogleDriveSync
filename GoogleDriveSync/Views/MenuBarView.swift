@@ -193,7 +193,7 @@ struct MenuBarView: View {
                                     .font(.system(size: 11, weight: .medium))
                                     .fixedSize(horizontal: false, vertical: true)
                             } icon: {
-                                Image(systemName: "trash")
+                                Image(systemName: folder.pendingDeletes?.allChanged == true ? "doc.on.doc" : "trash")
                                     .foregroundStyle(.orange)
                             }
 
@@ -203,10 +203,12 @@ struct MenuBarView: View {
                                 }
                                 .buttonStyle(.borderedProminent)
 
-                                Button("Put Back") {
-                                    Task { await syncManager.putBackDeletes(folder) }
+                                if folder.pendingDeletes?.allChanged != true {
+                                    Button("Put Back") {
+                                        Task { await syncManager.putBackDeletes(folder) }
+                                    }
+                                    .buttonStyle(.bordered)
                                 }
-                                .buttonStyle(.bordered)
                             }
                             .controlSize(.small)
                             .disabled(syncManager.isSyncing)

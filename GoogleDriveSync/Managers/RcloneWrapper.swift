@@ -411,6 +411,16 @@ actor RcloneWrapper {
             result = try await run(args + ["--force"])
         }
 
+        // Bisync also stops when every file changed, which in a small folder is one ordinary edit.
+        // Changed files are backed up before they're replaced, so small folders go ahead.
+        if !result.isSuccess, let onRemote = Self.allFilesChanged(result.stdout + "\n" + result.stderr) {
+            let count = Self.fileCount(local)
+            guard count <= Self.alwaysAllowedDeletes else {
+                throw RcloneError.deletesNeedApproval(PendingDeletes(count: count, onRemote: onRemote, allChanged: true))
+            }
+            result = try await run(args + ["--force"])
+        }
+
         let duration = Date().timeIntervalSince(startTime)
 
         guard result.isSuccess else {
@@ -598,6 +608,27 @@ actor RcloneWrapper {
         return PendingDeletes(count: count, onRemote: output[pathRange] == "Path1")
     }
 
+    /// Reads bisync's "Safety abort: all files were changed on Path1" error.
+    /// Returns true when the changes are on this Mac and would replace the files on the remote.
+    static func allFilesChanged(_ output: String) -> Bool? {
+        guard let regex = try? NSRegularExpression(pattern: #"all files were changed on (Path[12])"#),
+              let match = regex.firstMatch(in: output, range: NSRange(output.startIndex..., in: output)),
+              let pathRange = Range(match.range(at: 1), in: output) else {
+            return nil
+        }
+        return output[pathRange] == "Path1"
+    }
+
+    /// Number of files in a local folder, not counting .DS_Store.
+    private static func fileCount(_ path: String) -> Int {
+        guard let files = FileManager.default.enumerator(atPath: path) else { return 0 }
+        return files.reduce(0) { count, item in
+            guard let name = item as? String, !name.hasSuffix(".DS_Store"),
+                  files.fileAttributes?[.type] as? FileAttributeType == .typeRegular else { return count }
+            return count + 1
+        }
+    }
+
     /// Turns rclone's log into the lines that explain a failure, instead of only its final summary.
     static func errorSummary(_ output: String) -> String {
         let ansi = try? NSRegularExpression(pattern: "\u{1B}\\[[0-9;]*m")
@@ -680,13 +711,19 @@ struct SyncResult {
     }
 }
 
-/// Deletes bisync held back for the user to allow or undo.
+/// Deletes, or a change to every file, that bisync held back for the user to allow or undo.
 struct PendingDeletes: Codable, Equatable {
     let count: Int
-    /// true when files removed on this Mac would be deleted from the remote.
+    /// true when changes made on this Mac would be carried out on the remote.
     let onRemote: Bool
+    /// true when every file changed, rather than files being deleted.
+    var allChanged: Bool? = nil
 
     var summary: String {
-        "wants to delete \(count) file\(count == 1 ? "" : "s") \(onRemote ? "from Drive" : "from this Mac")"
+        let files = "\(count) file\(count == 1 ? "" : "s")"
+        if allChanged == true {
+            return "wants to replace all \(files) \(onRemote ? "on Drive" : "on this Mac")"
+        }
+        return "wants to delete \(files) \(onRemote ? "from Drive" : "from this Mac")"
     }
 }

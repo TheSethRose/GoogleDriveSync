@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **Small folders no longer get stuck when every file changed**: editing the only file in a folder tripped bisync's "all files were changed" safety stop on every run. Folders with 10 files or fewer now go ahead (the old copies are backed up); bigger ones ask with Allow.
 - **No more permanent deletes**: files a sync deletes or overwrites are moved to `99_Archive/_DriveSync Backups/` on the remote and `~/Library/Application Support/GoogleDriveSync/Backups/` locally.
 - **Two-way sync safety**: a missing or empty local folder is never synced.
 - **Resync recovery**: the resync step now passes `--resync`; retryable errors no longer force a resync.
