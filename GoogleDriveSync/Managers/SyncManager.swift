@@ -75,7 +75,9 @@ class SyncManager: ObservableObject {
             } else if let lastSync = lastSyncDate {
                 let formatter = RelativeDateTimeFormatter()
                 formatter.unitsStyle = .abbreviated
-                return "Last sync: \(formatter.localizedString(for: lastSync, relativeTo: Date()))"
+                formatter.dateTimeStyle = .named
+                // A sync that finished this instant can be a hair "in the future" and read as "in 0s".
+                return "Last sync: \(formatter.localizedString(for: lastSync, relativeTo: max(Date(), lastSync)))"
             } else {
                 return "Ready"
             }

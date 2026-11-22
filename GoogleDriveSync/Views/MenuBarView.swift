@@ -11,6 +11,8 @@ struct MenuBarView: View {
     @EnvironmentObject var syncManager: SyncManager
     @Environment(\.openSettings) private var openSettings
     @State private var expandedErrorID: UUID? = nil
+    @State private var showFolders = false
+    @State private var showAllErrors = false
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -55,6 +57,11 @@ struct MenuBarView: View {
         }
         .padding(12)
         .frame(width: 320)
+        // Open collapsed every time.
+        .onDisappear {
+            showFolders = false
+            showAllErrors = false
+        }
     }
     
     // MARK: - Sections
@@ -111,13 +118,6 @@ struct MenuBarView: View {
                                 .foregroundStyle(.secondary)
                         }
                         
-                        if !syncManager.syncProgress.isEmpty && !syncManager.syncProgress.contains("0.0 / 0.0") {
-                            Text(syncManager.syncProgress)
-                                .font(.system(size: 10))
-                                .foregroundStyle(.tertiary)
-                                .lineLimit(1)
-                        }
-                        
                         Spacer()
                     }
                 }
@@ -133,7 +133,27 @@ struct MenuBarView: View {
         return Group {
             if !foldersWithErrors.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
-                    ForEach(foldersWithErrors) { folder in
+                    if foldersWithErrors.count > 1 {
+                        Button {
+                            showAllErrors.toggle()
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(.red)
+                                    .font(.system(size: 12))
+                                Text("\(foldersWithErrors.count) folders failed")
+                                    .font(.system(size: 11, weight: .medium))
+                                Spacer()
+                                Image(systemName: showAllErrors ? "chevron.up" : "chevron.down")
+                                    .font(.system(size: 8))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    ForEach(foldersWithErrors.count > 1 && !showAllErrors ? [] : foldersWithErrors) { folder in
                         Button {
                             if expandedErrorID == folder.id {
                                 expandedErrorID = nil
@@ -302,15 +322,70 @@ struct MenuBarView: View {
         let enabledFolders = syncManager.folders.filter { $0.isEnabled }
         
         return VStack(alignment: .leading, spacing: 4) {
-            Text("Folders")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.bottom, 4)
-            
-            ForEach(enabledFolders) { folder in
-                FolderRowView(folder: folder)
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { showFolders.toggle() }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "folder")
+                        .frame(width: 18)
+                    Text("\(enabledFolders.count) folder\(enabledFolders.count == 1 ? "" : "s")")
+                    Spacer()
+                    Text(folderSummary)
+                        .font(.caption)
+                        .foregroundStyle(folderSummaryColor)
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(showFolders ? 90 : 0))
+                }
+                .padding(.vertical, 3)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if showFolders {
+                let rows = VStack(spacing: 4) {
+                    ForEach(enabledFolders) { folder in
+                        FolderRowView(folder: folder)
+                    }
+                }
+                // Capped so Sync All and Quit stay on screen however many folders there are.
+                if enabledFolders.count > 6 {
+                    ScrollView { rows }
+                        .frame(height: 340)
+                } else {
+                    rows
+                }
             }
         }
+    }
+
+    private var folderSummary: String {
+        let folders = syncManager.enabledFolders
+        let waiting = folders.filter { $0.pendingDeletes != nil }.count
+        let failed = folders.filter { $0.lastSyncStatus == .error && $0.pendingDeletes == nil }.count
+        if syncManager.isSyncing {
+            return "Syncing"
+        } else if waiting > 0 {
+            return "\(waiting) need\(waiting == 1 ? "s" : "") your OK"
+        } else if failed > 0 {
+            return "\(failed) failed"
+        } else if folders.allSatisfy({ $0.lastSyncStatus == .success }) {
+            return "All synced"
+        }
+        return "Ready"
+    }
+
+    private var folderSummaryColor: Color {
+        let folders = syncManager.enabledFolders
+        if syncManager.isSyncing {
+            return .orange
+        } else if folders.contains(where: { $0.pendingDeletes != nil }) {
+            return .orange
+        } else if folders.contains(where: { $0.lastSyncStatus == .error }) {
+            return .red
+        }
+        return .secondary
     }
     
     private var actionsSection: some View {
