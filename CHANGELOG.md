@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
-- **Menu fits on screen**: the folder list is collapsed into one summary row by default and scrolls when expanded, several errors fold into one row, and the sync progress shows only the overall bar, so Sync All and Quit are always reachable. "Last sync: in 0s" now reads "now".
+- **Menu fits on screen**: the folder list collapses into one summary row with an overall status icon (it remembers whether you left it open) and scrolls when expanded, several errors fold into one row, and the sync progress shows only the overall bar, so Sync All and Quit are always reachable. "Last sync: in 0s" now reads "now".
 - **Small folders no longer get stuck when every file changed**: editing the only file in a folder tripped bisync's "all files were changed" safety stop on every run. Folders with 10 files or fewer now go ahead (the old copies are backed up); bigger ones ask with Allow.
 - **No more permanent deletes**: files a sync deletes or overwrites are moved to `99_Archive/_DriveSync Backups/` on the remote and `~/Library/Application Support/GoogleDriveSync/Backups/` locally.
 - **Two-way sync safety**: a missing or empty local folder is never synced.

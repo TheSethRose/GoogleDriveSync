@@ -11,7 +11,7 @@ struct MenuBarView: View {
     @EnvironmentObject var syncManager: SyncManager
     @Environment(\.openSettings) private var openSettings
     @State private var expandedErrorID: UUID? = nil
-    @State private var showFolders = false
+    @AppStorage("DriveSync.ShowFolders") private var showFolders = false
     @State private var showAllErrors = false
     
     var body: some View {
@@ -57,9 +57,7 @@ struct MenuBarView: View {
         }
         .padding(12)
         .frame(width: 320)
-        // Open collapsed every time.
         .onDisappear {
-            showFolders = false
             showAllErrors = false
         }
     }
@@ -326,7 +324,7 @@ struct MenuBarView: View {
                 withAnimation(.easeInOut(duration: 0.15)) { showFolders.toggle() }
             } label: {
                 HStack(spacing: 8) {
-                    Image(systemName: "folder")
+                    folderStatusIcon
                         .frame(width: 18)
                     Text("\(enabledFolders.count) folder\(enabledFolders.count == 1 ? "" : "s")")
                     Spacer()
@@ -374,6 +372,28 @@ struct MenuBarView: View {
             return "All synced"
         }
         return "Ready"
+    }
+
+    /// Same icons as each folder row, for all folders at once.
+    @ViewBuilder
+    private var folderStatusIcon: some View {
+        let folders = syncManager.enabledFolders
+        if syncManager.isSyncing {
+            ProgressView()
+                .controlSize(.mini)
+        } else if folders.contains(where: { $0.pendingDeletes != nil }) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundStyle(.orange)
+        } else if folders.contains(where: { $0.lastSyncStatus == .error }) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundStyle(.red)
+        } else if folders.allSatisfy({ $0.lastSyncStatus == .success }) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        } else {
+            Image(systemName: "circle")
+                .foregroundStyle(.secondary)
+        }
     }
 
     private var folderSummaryColor: Color {
